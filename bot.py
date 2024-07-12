@@ -3,19 +3,28 @@ from discord.ext import commands
 import asyncio
 import os
 import yt_dlp as youtube_dl
+from yt_dlp.utils import DownloadError
 from dotenv import load_dotenv
+import re
+import shutil
 
 load_dotenv()
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
-
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# Ścieżka do folderu music
+music_folder = 'C:\\Users\\Norbert\\PycharmProjects\\discord_bot\\music'
+
+# Upewnij się, że folder istnieje
+if not os.path.exists(music_folder):
+    os.makedirs(music_folder)
+
 ytdl_format_options = {
-    'format': 'bestaudio/best',
-    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+    'format': 'bestaudio[ext=m4a]/bestaudio/best',
+    'outtmpl': os.path.join(music_folder, '%(extractor)s-%(id)s-%(title)s.%(ext)s'),
     'restrictfilenames': True,
     'noplaylist': True,
     'nocheckcertificate': True,
@@ -42,13 +51,22 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.url = data.get('url')
 
     @classmethod
-    async def from_url(cls, url, *, loop=None, stream=False):
+    async def from_url(cls, url, *, loop=None, stream=False, max_duration=600):
         loop = loop or asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
-        if 'entries' in data:
-            data = data['entries'][0]
-        filename = data['url'] if stream else ytdl.prepare_filename(data)
-        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+        try:
+            # Opróżnij folder przed pobraniem nowego pliku
+            clear_music_folder()
+            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
+            if data.get('duration', 0) > max_duration:
+                raise ValueError('Film jest zbyt długi. Maksymalna dozwolona długość to 10 minut.')
+            if stream:
+                filename = data['url']
+            else:
+                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=True))
+                filename = ytdl.prepare_filename(data)
+            return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+        except DownloadError as e:
+            raise ValueError(f'Nie udało się pobrać: {str(e)}')
 
 
 queue = []
@@ -59,30 +77,31 @@ async def on_ready():
     print(f'Bot {bot.user} jest gotowy!')
 
 
+def is_valid_url(url):
+    regex = re.compile(
+        r'^(https?://)?(www\.)?(youtube\.com|youtu\.?be)/.+$'
+    )
+    return re.match(regex, url) is not None
+
+
 @bot.command(name='play', help='Odtwarza muzykę z YouTube')
 async def play(ctx, url):
-    async with ctx.typing():
-        player = await YTDLSource.from_url(url, loop=bot.loop)
-        queue.append(player)
-        await ctx.send(f'Dodano do kolejki: {player.title}')
-
-        if ctx.voice_client is None:
-            if ctx.author.voice:
-                channel = ctx.author.voice.channel
-                await channel.connect()
-            else:
-                await ctx.send("Musisz być na kanale głosowym, aby użyć tej komendy.")
-                return
-
-        if not ctx.voice_client.is_playing():
-            await play_next(ctx)
+    if not is_valid_url(url):
+        await ctx.send('Proszę podać prawidłowy link do YouTube.')
+        return
+    await add_song(ctx, url)
 
 
 async def play_next(ctx):
     if queue:
-        player = queue.pop(0)
-        ctx.voice_client.play(player, after=lambda e: bot.loop.create_task(play_next(ctx)))
-        await ctx.send(f'Odgrywam: {player.title}')
+        url = queue.pop(0)
+        try:
+            player = await YTDLSource.from_url(url, loop=bot.loop)
+            ctx.voice_client.play(player, after=lambda e: bot.loop.create_task(play_next(ctx)))
+            await ctx.send(f'Odgrywam: {player.title}')
+        except ValueError as e:
+            await ctx.send(f'Wystąpił błąd podczas odtwarzania piosenki: {e}')
+            await play_next(ctx)
     else:
         await ctx.voice_client.disconnect()
 
@@ -90,86 +109,131 @@ async def play_next(ctx):
 @bot.command(name='stop', help='Zatrzymuje odtwarzanie muzyki')
 async def stop(ctx):
     voice_client = ctx.voice_client
-    if voice_client.is_playing():
+    if voice_client and voice_client.is_playing():
         voice_client.stop()
     queue.clear()
     await voice_client.disconnect()
-    await ctx.send('Muzyka zatrzymana.')
+    clear_music_folder()
+    await ctx.send('Muzyka zatrzymana i folder opróżniony.')
 
 
 @bot.command(name='skip', help='Pomija aktualnie odtwarzany utwór')
 async def skip(ctx):
     voice_client = ctx.voice_client
-    if voice_client.is_playing():
+    if voice_client and voice_client.is_playing():
         voice_client.stop()
         await ctx.send('Pomijanie utworu...')
 
 
-# Komendy dodające określone piosenki do kolejki
-@bot.command(name='norbi', help='Dodaje do kolejki piosenkę "Norbiego"')
-async def add_norbi(ctx):
-    url = 'https://www.youtube.com/watch?v=u1I9ITfzqFs'
-    await add_song(ctx, url)
-
-
-@bot.command(name='panek', help='Dodaje do kolejki piosenkę "Panka"')
-async def add_panek(ctx):
-    url = 'https://www.youtube.com/watch?v=GAZU62dMhkg'
-    await add_song(ctx, url)
-
-
-@bot.command(name='wirus', help='Dodaje do kolejki piosenkę "Wirusa"')
-async def add_wirus(ctx):
-    url = 'https://www.youtube.com/watch?v=M9XbJxKSTlk'
-    await add_song(ctx, url)
-
-
-@bot.command(name='filip', help='Dodaje do kolejki piosenkę "Filipa"')
-async def add_filip(ctx):
-    url = 'https://www.youtube.com/watch?v=_UpJBdXrYjo'
-    await add_song(ctx, url)
-
-
-@bot.command(name='chwaster', help='Dodaje do kolejki piosenkę "Chwastera"')
-async def add_chwaster(ctx):
-    url = 'https://www.youtube.com/watch?v=SzzERnsKMFg'
-    await add_song(ctx, url)
-
-
-@bot.command(name='stasiak', help='Dodaje do kolejki piosenkę "Stasiaka"')
-async def add_stasiak(ctx):
-    url = 'https://www.youtube.com/watch?v=EssaGhC29zo'
-    await add_song(ctx, url)
-
-
-@bot.command(name='przemek', help='Dodaje do kolejki piosenkę "Przemka"')
-async def add_przemek(ctx):
-    url = 'https://www.youtube.com/watch?v=PSg7Zs5vlBQ'
-    await add_song(ctx, url)
-
-
-@bot.command(name='gamala', help='Dodaje do kolejki piosenkę "Gamali"')
-async def add_gamala(ctx):
-    url = 'https://youtu.be/bpOSxM0rNPM?si=QKxKQ_2R4R3yd4iO'
-    await add_song(ctx, url)
-
-
 async def add_song(ctx, url):
     async with ctx.typing():
-        player = await YTDLSource.from_url(url, loop=bot.loop)
-        queue.append(player)
-        await ctx.send(f'Dodano do kolejki: {player.title}')
-
         if ctx.voice_client is None:
             if ctx.author.voice:
-                channel = ctx.author.voice.channel
-                await channel.connect()
+                try:
+                    channel = ctx.author.voice.channel
+                    await channel.connect()
+                except asyncio.TimeoutError:
+                    await ctx.send('Timeout podczas łączenia z kanałem głosowym. Spróbuj ponownie.')
+                    return
+                except discord.errors.ClientException as e:
+                    await ctx.send(f'Błąd podczas łączenia z kanałem głosowym: {e}')
+                    return
             else:
                 await ctx.send("Musisz być na kanale głosowym, aby użyć tej komendy.")
                 return
 
+        queue.append(url)
+        await ctx.send(f'Dodano do kolejki: {url}')
+
         if not ctx.voice_client.is_playing():
             await play_next(ctx)
-# Uruchomienie bota
 
+
+def clear_music_folder():
+    for filename in os.listdir(music_folder):
+        file_path = os.path.join(music_folder, filename)
+        try:
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                os.unlink(file_path)
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+        except Exception as e:
+            print(f'Błąd podczas usuwania pliku {file_path}: {e}')
+
+
+# Dodawanie określonych piosenek do kolejki za pomocą wspólnej funkcji add_song
+songs = {
+    'norbi': 'https://www.youtube.com/watch?v=u1I9ITfzqFs',
+    'panek': 'https://www.youtube.com/watch?v=GAZU62dMhkg',
+    'wirus': 'https://www.youtube.com/watch?v=M9XbJxKSTlk',
+    'filip': 'https://www.youtube.com/watch?v=_UpJBdXrYjo',
+    'chwaster': 'https://www.youtube.com/watch?v=SzzERnsKMFg',
+    'stasiak': 'https://www.youtube.com/watch?v=EssaGhC29zo',
+    'przemek': 'https://www.youtube.com/watch?v=PSg7Zs5vlBQ',
+    'gamala': 'https://youtu.be/bpOSxM0rNPM?si=QKxKQ_2R4R3yd4iO',
+    'gralak': 'https://www.youtube.com/watch?v=5Jp9VADgkUk'  # Nowa piosenka dodana do słownika
+}
+
+
+# Tworzenie asynchronicznych funkcji dla każdej piosenki
+async def create_song_command(ctx, song_name):
+    url = songs.get(song_name)
+    if url:
+        await add_song(ctx, url)
+    else:
+        await ctx.send(f'Nie znaleziono piosenki o nazwie "{song_name}".')
+
+
+for command in songs.keys():
+    async def song_command(ctx, command=command):
+        await create_song_command(ctx, command)
+
+
+    bot.command(name=command, help=f'Dodaje do kolejki piosenkę "{command}"')(song_command)
+
+
+@bot.command(name='change', help='Zmienia link przypisany do komendy')
+async def change(ctx, command, new_url):
+    if command not in songs:
+        await ctx.send(f'Nie ma komendy o nazwie {command}.')
+        return
+
+    if not is_valid_url(new_url):
+        await ctx.send('Proszę podać prawidłowy link do YouTube.')
+        return
+
+    songs[command] = new_url
+    await ctx.send(f'Link przypisany do komendy "{command}" został zmieniony na {new_url}.')
+
+
+# Dodanie komend do zmiany linków
+for command in songs.keys():
+    async def change_command(ctx, new_url, command=command):
+        await change(ctx, command, new_url)
+
+
+    bot.command(name=f'{command}_change', help=f'Zmienia link przypisany do komendy "{command}"')(change_command)
+
+# Uruchomienie bota
 bot.run(DISCORD_BOT_TOKEN)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
