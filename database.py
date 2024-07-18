@@ -3,8 +3,6 @@ import re
 import unicodedata
 
 
-
-
 def normalize_text(text):
     text = unicodedata.normalize('NFKD', text)
     text = re.sub(r'[\u0300-\u036f]', '', text)
@@ -114,6 +112,14 @@ def search_song_in_playlist(playlist_name, keyword):
     conn.close()
     return None
 
+
+def search_song_in_all_playlists(keyword):
+    playlists = get_all_playlists()
+    for playlist_name, _ in playlists:
+        song = search_song_in_playlist(playlist_name, keyword)
+        if song:
+            return playlist_name, song
+    return None, None
 
 
 
